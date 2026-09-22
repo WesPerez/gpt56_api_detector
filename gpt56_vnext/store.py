@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 import queue
@@ -136,6 +137,7 @@ class SQLiteStateStore:
             CREATE INDEX IF NOT EXISTS idx_jobs_session_cycle ON jobs(session_id, cycle, ordinal);
             CREATE INDEX IF NOT EXISTS idx_attempts_session_job ON attempts(session_id, job_id, attempt_no);
             CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id, event_id);
+            CREATE INDEX IF NOT EXISTS idx_events_age ON events(created_at, event_id);
             CREATE INDEX IF NOT EXISTS idx_results_session ON results(session_id, result_id);
             """
         )
@@ -595,6 +597,33 @@ class SQLiteStateStore:
             )
             connection.commit()
             return int(cursor.lastrowid)
+
+        return self._write(write)
+
+    def prune_events(self, *, now: datetime | None = None, retention_days: int = 3,
+                     max_events: int = 100_000, batch_size: int = 1_000) -> int:
+        """Retire oldest diagnostic events; completed reports and run state are separate."""
+        if not 1 <= retention_days <= 90 or not 1 <= max_events <= 1_000_000 or not 1 <= batch_size <= 1_000:
+            raise ValueError("Invalid event retention bounds")
+        cutoff = ((now or datetime.now(timezone.utc)) - timedelta(days=retention_days)).isoformat()
+
+        def write(connection: sqlite3.Connection) -> int:
+            # Keep at least the newest max_events rows during capacity cleanup.
+            boundary = connection.execute(
+                "SELECT created_at,event_id FROM events ORDER BY created_at DESC,event_id DESC LIMIT 1 OFFSET ?",
+                (max_events - 1,),
+            ).fetchone()
+            age, identity = (boundary[0], boundary[1]) if boundary else ("", 0)
+            cursor = connection.execute(
+                "DELETE FROM events WHERE event_id IN ("
+                "SELECT e.event_id FROM events e JOIN sessions s ON s.session_id=e.session_id "
+                "WHERE s.status NOT IN ('prepared','running','stopping') "
+                "AND (e.created_at<? OR (e.created_at,e.event_id)<(?,?)) "
+                "ORDER BY e.created_at,e.event_id LIMIT ?)",
+                (cutoff, age, identity, batch_size),
+            )
+            connection.commit()
+            return cursor.rowcount
 
         return self._write(write)
 

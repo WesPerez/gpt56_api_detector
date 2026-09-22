@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from concurrent.futures import TimeoutError as FutureTimeout
 from contextlib import ExitStack
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -61,8 +62,27 @@ class AppState:
             self.thread.start()
             resources.callback(self._stop_loop)
             self.schedule = SingleRunSchedule(self.store, self.scheduled_run)
+            self.log_maintenance_task = self.call(self._start_log_maintenance())
             self._resources = resources.pop_all()
             asyncio.run_coroutine_threadsafe(self.resume_updated_schedule(), self.loop)
+
+    async def _start_log_maintenance(self):
+        return asyncio.create_task(self._maintain_event_logs())
+
+    async def _maintain_event_logs(self):
+        while True:
+            pending = asyncio.create_task(asyncio.to_thread(self.store.prune_events))
+            try:
+                removed = await asyncio.shield(pending)
+            except asyncio.CancelledError:
+                # A queued SQLite write must finish before shutdown closes the store.
+                await asyncio.gather(pending, return_exceptions=True)
+                raise
+            except Exception:
+                logging.getLogger(__name__).exception("Event retention failed")
+                removed = 0
+            # Catch up in bounded transactions without blocking the request loop.
+            await asyncio.sleep(1 if removed == 1_000 else 300)
 
     async def resume_updated_schedule(self):
         resume_schedule = self.store.document('settings', 'resume_schedule_after_update')
@@ -247,6 +267,8 @@ class AppState:
                 "endpoints": self.presets.list(), "defaults": self.store.document("settings", "default_benchmarks") or {}, "catalog": self.catalog.index()}
 
     async def shutdown(self):
+        self.log_maintenance_task.cancel()
+        await asyncio.gather(self.log_maintenance_task, return_exceptions=True)
         self.schedule.pause()
         for runner, _task in tuple(self.active.values()):
             runner.stop()
